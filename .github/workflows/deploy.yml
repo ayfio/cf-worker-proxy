@@ -1,0 +1,30 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'worker.js' ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy to Cloudflare
+        run: |
+          echo "🔧 Deploying worker: proxy-vless"
+          echo "📝 Account ID: ${{ secrets.CF_ACCOUNT_ID }}"
+          wrangler deploy worker.js \
+            --name proxy-vless \
+            --account-id ${{ secrets.CF_ACCOUNT_ID }} \
+            --api-token ${{ secrets.CF_API_TOKEN }} \
+            --compatibility-date 2024-01-01

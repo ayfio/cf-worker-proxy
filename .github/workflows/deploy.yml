@@ -16,15 +16,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Wrangler
-        run: npm install -g wrangler
-
       - name: Deploy to Cloudflare
-        run: |
-          echo "🔧 Deploying worker: proxy-vless"
-          echo "📝 Account ID: ${{ secrets.CF_ACCOUNT_ID }}"
-          wrangler deploy worker.js \
-            --name proxy-vless \
-            --account-id ${{ secrets.CF_ACCOUNT_ID }} \
-            --api-token ${{ secrets.CF_API_TOKEN }} \
-            --compatibility-date 2024-01-01
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

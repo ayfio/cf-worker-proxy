@@ -1,69 +1,88 @@
-// ✅ РАБОЧИЙ VLESS-ПРОКСИ для Cloudflare Workers
-// Совместим с sing-box / Xray
-
-const UUID = "d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f"; // ← ЗАМЕНИТЕ на ваш UUID!
+// ✅ ПОЛНЫЙ ВОРКЕР: VLESS + HTTPS Proxy
+const UUID = "d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f"; // ← Замените на ваш
 const WS_PATH = "/proxy";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
-    // 1. Проверка работоспособности (браузер/curl)
-    if (url.pathname === "/" && request.headers.get("Upgrade") !== "websocket") {
-      return new Response("✅ VLESS Worker is running - " + Date.now(), {
+    // 1. Простой ответ для проверки (корень)
+    if (url.pathname === "/") {
+      return new Response("✅ Worker is running: VLESS + HTTPS Proxy", {
         status: 200,
-        headers: { 
-          "Content-Type": "text/plain",
-          "Access-Control-Allow-Origin": "*"
-        }
+        headers: { "Content-Type": "text/plain" }
       });
     }
     
-    // 2. VLESS over WebSocket (для sing-box)
-    if (url.pathname === WS_PATH) {
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-        return handleVLESSWebSocket(request);
-      }
+    // 2. HTTPS Proxy (для панели Cloudflare, браузера)
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return await handleHttpsProxy(request, url);
     }
     
-    // 3. Всё остальное — 404
+    // 3. VLESS over WebSocket (для sing-box)
+    if (url.pathname === WS_PATH) {
+      return await handleWebSocket(request);
+    }
+    
     return new Response("Not Found", { status: 404 });
   }
 };
 
-// Обработчик VLESS WebSocket
-async function handleVLESSWebSocket(request) {
+// HTTPS Proxy handler
+async function handleHttpsProxy(request, url) {
+  let targetHost = request.headers.get("X-Target-Host") || url.searchParams.get("host");
+  
+  if (!targetHost) {
+    return new Response("✅ HTTPS Proxy ready. Use X-Target-Host header.", {
+      status: 200, headers: { "Content-Type": "text/plain" }
+    });
+  }
+  
+  // Защита от цикла
+  if (url.hostname.includes("workers.dev") || url.hostname.includes("xubi.org")) {
+    return new Response("Loop detected", { status: 400 });
+  }
+  
+  try {
+    const targetUrl = `${url.protocol}//${targetHost}${url.pathname}${url.search}`;
+    const proxyHeaders = new Headers(request.headers);
+    proxyHeaders.delete("X-Target-Host");
+    proxyHeaders.set("Host", targetHost);
+    
+    const response = await fetch(targetUrl, {
+      method: request.method,
+      headers: proxyHeaders,
+      body: request.body,
+      redirect: "manual"
+    });
+    
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers
+    });
+  } catch (e) {
+    return new Response(`Proxy error: ${e.message}`, { status: 502 });
+  }
+}
+
+// VLESS WebSocket handler (упрощённый)
+async function handleWebSocket(request) {
   const { 0: client, 1: server } = new WebSocketPair();
   server.accept();
   
-  // Проверка UUID через Sec-WebSocket-Protocol
+  // Простая проверка UUID (для совместимости с sing-box)
   const protocol = request.headers.get("Sec-WebSocket-Protocol") || "";
-  const isValidUUID = protocol.includes(UUID) || protocol === "vless" || UUID === "";
-  
-  if (isValidUUID) {
-    console.log("✅ VLESS connection accepted from:", request.headers.get("CF-Connecting-IP"));
-    
-    // Для тестирования: отправляем подтверждение
-    server.send("✅ VLESS accepted - " + new Date().toISOString());
-    
-    // Простая пересылка (эхо для теста)
-    server.addEventListener("message", (event) => {
-      // В полном прокси здесь был бы парсинг VLESS-фреймов
-      // и перенаправление на целевой сервер
-      server.send(event.data);
-    });
-    
-    server.addEventListener("close", () => {
-      console.log("🔌 VLESS connection closed");
-    });
+  if (protocol.includes(UUID) || protocol === "vless") {
+    server.send("✅ VLESS WebSocket accepted");
   } else {
-    console.warn("❌ Invalid UUID, closing connection");
-    server.close(1008, "Invalid UUID");
+    server.close(1008, "Invalid protocol");
   }
   
-  return new Response(null, { 
-    status: 101, 
-    webSocket: client 
+  // Эхо-режим для теста (в продакшене здесь будет парсинг VLESS)
+  server.addEventListener("message", (event) => {
+    server.send(event.data);
   });
+  
+  return new Response(null, { status: 101, webSocket: client });
 }

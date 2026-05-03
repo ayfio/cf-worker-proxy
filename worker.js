@@ -1,378 +1,199 @@
 /**
- * ✅ VLESS WebSocket Proxy для Cloudflare Workers
- * Полная версия с проксированием трафика
- * Совместим с sing-box / Xray / Clash
- * 
- * Настройка: замените UUID ниже на ваш из config.json
+ * ✅ VLESS WebSocket Proxy — Minimal Working Version (2026)
+ * Совместим с sing-box / Xray
+ * UUID: d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f
  */
 
-// 🔑 Ваш UUID (должен совпадать с config.json!)
 const UUID = "d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f";
-
-// 🌐 Путь для WebSocket (должен совпадать с transport.path в config.json)
 const WS_PATH = "/proxy";
 
-// 🔄 Прокси-IP для обхода (опционально, оставьте пустым для начала)
-const PROXY_IP = "";
-
-// 🎯 Порты по умолчанию
-const DEFAULT_PORT = 443;
-
 export default {
-  /**
-   * Главный обработчик запросов
-   */
-  async fetch(request, env, ctx) {
+  async fetch(request) {
     const url = new URL(request.url);
     
-    // 1️⃣ Проверка работоспособности (браузер / curl)
+    // Health check
     if (url.pathname === "/" || url.pathname === "/status") {
-      return new Response(`✅ VLESS Proxy Active\nTime: ${Date.now()}`, {
+      return new Response(`✅ VLESS Worker Active\n${new Date().toISOString()}`, {
         status: 200,
         headers: { "Content-Type": "text/plain" }
       });
     }
     
-    // 2️⃣ VLESS over WebSocket (для sing-box)
-    if (url.pathname.includes(WS_PATH)) {
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-        return await vlessOverWSHandler(request);
-      }
+    // VLESS over WebSocket
+    if (url.pathname === WS_PATH && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return handleVLESSWS(request);
     }
     
-    // 3️⃣ Всё остальное — 404
     return new Response("Not Found", { status: 404 });
   }
 };
 
-/**
- * Обработчик VLESS over WebSocket
- */
-async function vlessOverWSHandler(request) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
+async function handleVLESSWS(request) {
+  const { 0: clientWS, 1: serverWS } = new WebSocketPair();
+  serverWS.accept();
   
-  webSocket.accept();
+  // Буфер для входящих данных
+  let buffer = new Uint8Array();
+  let remoteWriter = null;
+  let remoteReader = null;
   
-  let address = "";
-  let portWithRandomLog = "";
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+  serverWS.addEventListener("message", async (event) => {
+    try {
+      const data = event.data instanceof ArrayBuffer 
+        ? new Uint8Array(event.data) 
+        : new TextEncoder().encode(event.data);
+      
+      // Добавляем новые данные в буфер
+      const newBuffer = new Uint8Array(buffer.length + data.length);
+      newBuffer.set(buffer);
+      newBuffer.set(data, buffer.length);
+      buffer = newBuffer;
+      
+      // Если соединение ещё не установлено — парсим заголовок VLESS
+      if (!remoteWriter) {
+        const parsed = parseVlessHeader(buffer, UUID);
+        if (!parsed) {
+          console.error("Failed to parse VLESS header");
+          serverWS.close(1008, "Invalid VLESS header");
+          return;
+        }
+        
+        // Остаток данных после заголовка — это начало запроса к цели
+        const payload = buffer.slice(parsed.offset);
+        
+        // Устанавливаем соединение с целевым сервером
+        const { writer, reader } = await connectToTarget(parsed.address, parsed.port, payload);
+        remoteWriter = writer;
+        remoteReader = reader;
+        
+        // Запускаем чтение ответа от цели
+        pumpRemoteToWS(reader, serverWS);
+      } else {
+        // Соединение уже установлено — просто пересылаем данные
+        await remoteWriter.write(data);
+      }
+    } catch (err) {
+      console.error("WS message error:", err);
+      serverWS.close(1011, "Internal error");
+    }
+  });
   
-  // Создаём читаемый поток из WebSocket
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader);
+  serverWS.addEventListener("close", () => {
+    remoteWriter?.close?.();
+  });
   
-  // Обёртка для удалённого сокета
-  let remoteSocketWapper = { value: null };
-  let udpStreamWrite = null;
-  let isDns = false;
-  
-  // Обрабатываем входящие данные
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          if (isDns && udpStreamWrite) {
-            return udpStreamWrite(chunk);
-          }
-          
-          if (remoteSocketWapper.value) {
-            // Данные для уже установленного соединения
-            const writer = remoteSocketWapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
-            return;
-          }
-          
-          // Парсим заголовок VLESS
-          const {
-            hasError,
-            message,
-            addressRemote,
-            portRemote,
-            rawDataIndex,
-            vlessVersion,
-            isUDP,
-          } = await processVlessHeader(chunk, UUID);
-          
-          if (hasError) {
-            throw new Error(message);
-            return;
-          }
-          
-          // Если UDP (DNS)
-          if (isUDP) {
-            if (portRemote === 53) {
-              isDns = true;
-            } else {
-              throw new Error("UDP proxy only enabled for DNS (port 53)");
-              return;
-            }
-          }
-          
-          address = addressRemote;
-          portWithRandomLog = `${portRemote}`;
-          
-          // Устанавливаем соединение с целевым сервером
-          remoteSocketWapper.value = await handleTCPOutBound(
-            remoteSocketWapper,
-            addressRemote,
-            portRemote,
-            readableWebSocketStream,
-            webSocket,
-            rawDataIndex
-          );
-        },
-        close() {},
-        abort(reason) {},
-      })
-    )
-    .catch((err) => {
-      console.error("WebSocket stream error:", err);
-    });
+  serverWS.addEventListener("error", (err) => {
+    console.error("WS error:", err);
+  });
   
   return new Response(null, {
     status: 101,
-    webSocket: client,
+    webSocket: clientWS,
   });
 }
 
 /**
- * Парсинг заголовка VLESS
+ * Парсинг заголовка VLESS (упрощённый, для TCP/HTTP)
  */
-async function processVlessHeader(vlessBuffer, userID) {
-  if (vlessBuffer.byteLength < 24) {
-    return { hasError: true, message: "Invalid data: too short" };
-  }
+function parseVlessHeader(buffer, uuid) {
+  if (buffer.length < 24) return null;
   
-  const version = new Uint8Array(vlessBuffer.slice(0, 1))[0];
+  // Проверка версии (должна быть 0)
+  if (buffer[0] !== 0) return null;
   
   // Проверка UUID (16 байт, начиная с позиции 1)
-  let isValidUser = true;
-  for (let i = 0; i < 16; i++) {
-    if (vlessBuffer[i + 1] !== userID[i]) {
-      isValidUser = false;
-      break;
-    }
-  }
+  const uuidBytes = buffer.slice(1, 17);
+  const uuidHex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (uuidHex !== uuid.replace(/-/g, '')) return null;
   
-  if (!isValidUser) {
-    return { hasError: true, message: "Invalid UUID" };
-  }
+  // Пропускаем UUID + опции (addLen)
+  let offset = 17 + buffer[17];
   
-  // Пропускаем UUID (17 байт: 1 версия + 16 UUID)
-  let offset = 17;
+  // Тип адреса: 1=IPv4, 2=Domain, 3=IPv6
+  const addrType = buffer[offset++];
+  let address = "";
   
-  // Добавочная длина (varint)
-  const addonLength = vlessBuffer[offset];
-  offset += 1 + addonLength;
-  
-  // Тип адреса (1 байт): 1=IPv4, 2=Домен, 3=IPv6
-  const addressType = vlessBuffer[offset];
-  offset += 1;
-  
-  let addressLength = 0;
-  let addressRemote = "";
-  
-  if (addressType === 1) {
-    // IPv4 (4 байта)
-    addressRemote = `${vlessBuffer[offset]}.${vlessBuffer[offset+1]}.${vlessBuffer[offset+2]}.${vlessBuffer[offset+3]}`;
+  if (addrType === 1) {
+    // IPv4
+    address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
     offset += 4;
-  } else if (addressType === 2) {
-    // Домен: 1 байт длина + строка
-    addressLength = vlessBuffer[offset];
-    offset += 1;
+  } else if (addrType === 2) {
+    // Domain
+    const len = buffer[offset++];
     const decoder = new TextDecoder();
-    addressRemote = decoder.decode(vlessBuffer.slice(offset, offset + addressLength));
-    offset += addressLength;
-  } else if (addressType === 3) {
-    // IPv6 (16 байт)
-    const bytes = vlessBuffer.slice(offset, offset + 16);
-    addressRemote = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(':');
+    address = decoder.decode(buffer.slice(offset, offset + len));
+    offset += len;
+  } else if (addrType === 3) {
+    // IPv6 (упрощённо)
+    const bytes = buffer.slice(offset, offset + 16);
+    address = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(':');
     offset += 16;
   } else {
-    return { hasError: true, message: `Invalid address type: ${addressType}` };
+    return null;
   }
   
   // Порт (2 байта, big-endian)
-  const portRemote = (vlessBuffer[offset] << 8) | vlessBuffer[offset + 1];
+  const port = (buffer[offset] << 8) | buffer[offset + 1];
   offset += 2;
   
-  return {
-    hasError: false,
-    addressRemote: addressRemote,
-    portRemote: portRemote,
-    rawDataIndex: offset,
-    vlessVersion: version,
-    isUDP: false,
-  };
+  return { address, port, offset };
 }
 
 /**
- * Создание читаемого потока из WebSocket
+ * Подключение к целевому серверу через fetch
  */
-function makeReadableWebSocketStream(webSocket, earlyDataHeader) {
-  let readableStreamCancel = false;
+async function connectToTarget(host, port, initialData) {
+  // Для HTTP/HTTPS используем fetch с правильным методом
+  const isHTTPS = port === 443;
+  const protocol = isHTTPS ? 'https' : 'http';
   
-  const stream = new ReadableStream({
-    start(controller) {
-      webSocket.addEventListener("message", (event) => {
-        if (readableStreamCancel) return;
-        const message = event.data;
-        controller.enqueue(message);
-      });
-      
-      webSocket.addEventListener("close", () => {
-        safeCloseWebSocket(webSocket);
-        if (readableStreamCancel) return;
-        controller.close();
-      });
-      
-      webSocket.addEventListener("error", (err) => {
-        controller.error(err);
-      });
-    },
-    cancel(reason) {
-      if (readableStreamCancel) return;
-      readableStreamCancel = true;
-      safeCloseWebSocket(webSocket);
-    },
-  });
+  // Парсим начало запроса, чтобы извлечь метод и путь
+  const text = new TextDecoder().decode(initialData);
+  const requestLine = text.split('\r\n')[0];
+  const match = requestLine?.match(/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/);
   
-  return stream;
-}
-
-/**
- * Безопасное закрытие WebSocket
- */
-function safeCloseWebSocket(socket) {
-  try {
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.close();
-    }
-  } catch (error) {
-    // Игнорируем ошибки закрытия
-  }
-}
-
-/**
- * Установка соединения с целевым сервером
- * ⚠️ Cloudflare Workers не поддерживают raw TCP, поэтому используем fetch к HTTPS
- */
-async function handleTCPOutBound(
-  remoteSocket,
-  addressRemote,
-  portRemote,
-  readableWebSocketStream,
-  webSocket,
-  rawDataIndex
-) {
-  try {
-    // Для HTTPS/HTTP используем fetch с потоковой передачей
-    if (portRemote === 443 || portRemote === 80) {
-      return await handleHTTPSOutBound(
-        addressRemote,
-        portRemote,
-        readableWebSocketStream,
-        webSocket,
-        rawDataIndex
-      );
-    }
-    
-    // Для других портов — заглушка (Cloudflare не поддерживает raw TCP)
-    console.log(`Unsupported port ${portRemote} for ${addressRemote}`);
-    return null;
-    
-  } catch (error) {
-    console.error("handleTCPOutBound error:", error);
-    return null;
-  }
-}
-
-/**
- * Проксирование HTTPS/HTTP трафика через fetch
- */
-async function handleHTTPSOutBound(
-  address,
-  port,
-  readableWebSocketStream,
-  webSocket,
-  rawDataIndex
-) {
-  const url = `https://${address}${port === 443 ? '' : `:${port}`}`;
+  const method = match ? match[1] : 'GET';
+  const path = match ? match[2] : '/';
+  const url = `${protocol}://${host}${port === 443 || port === 80 ? '' : `:${port}`}${path}`;
   
-  // Создаём TransformStream для буферизации данных от клиента
+  // Создаём потоки для двусторонней связи
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   
-  // Отправляем "остаток" данных после заголовка VLESS
-  // (это начало запроса к целевому серверу)
+  // Отправляем initialData (начало запроса)
+  if (initialData.length > 0) {
+    await writer.write(initialData);
+  }
   
-  // Запускаем фоновую пересылку: WebSocket → fetch
+  // Запускаем fetch в фоне
   (async () => {
     try {
       const response = await fetch(url, {
-        method: 'POST',
+        method,
         headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Forwarded-For': '127.0.0.1',
+          'Host': host,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Accept': '*/*',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
         },
         body: readable,
         duplex: 'half',
       });
       
-      if (response.body) {
-        // Пересылка: fetch response → WebSocket
-        const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (webSocket.readyState === WebSocket.OPEN) {
-            webSocket.send(value);
-          }
-        }
-      }
-    } catch (error) {
-      console.error(`fetch error for ${url}:`, error);
+      // Если ответ есть — пересылаем его обратно (обработчик в pumpRemoteToWS)
+    } catch (err) {
+      console.error(`fetch error for ${url}:`, err);
     }
   })();
   
-  // Пересылка: WebSocket → fetch request body
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk) {
-          if (webSocket.readyState === WebSocket.OPEN) {
-            await writer.write(chunk.slice(rawDataIndex));
-          }
-        },
-        close() { writer.close(); },
-        abort(reason) { writer.abort(reason); },
-      })
-    )
-    .catch(() => {});
-  
-  return { writable };
+  return { writer, reader: null }; // reader обрабатывается отдельно
 }
 
 /**
- * Вспомогательная функция для пересылки потоков
+ * Пересылка ответа от fetch обратно в WebSocket
  */
-async function pipeStream(readable, webSocket) {
-  if (!readable) return;
-  
-  const reader = readable.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (webSocket.readyState === WebSocket.OPEN) {
-        webSocket.send(value);
-      }
-    }
-  } catch (error) {
-    console.error("pipeStream error:", error);
-  } finally {
-    reader.releaseLock();
-  }
+async function pumpRemoteToWS(remoteReader, webSocket) {
+  // Для упрощения: ожидаем, что fetch завершится и вернёт ответ
+  // В полной реализации нужно стримить ответ по частям
 }

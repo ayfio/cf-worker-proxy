@@ -1,107 +1,101 @@
 /**
- * ✅ VLESS WebSocket Proxy — Minimal Working Version (2026)
- * Совместим с sing-box / Xray
- * UUID: d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f
+ * ✅ WORKING VLESS WebSocket Proxy — Minimal 2026
+ * Uses cloudflare:sockets for raw TCP proxying
+ * Compatible with sing-box / Xray / Clash
  */
+
+// @ts-ignore
+import { connect } from 'cloudflare:sockets';
 
 const UUID = "d3f8a1c9-7b4e-4d2a-9f6c-8e5b3a7d1c4f";
 const WS_PATH = "/proxy";
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     
-    // Health check
+    // 🔹 Health check
     if (url.pathname === "/" || url.pathname === "/status") {
-      return new Response(`✅ VLESS Worker Active\n${new Date().toISOString()}`, {
+      return new Response(`✅ VLESS Worker OK\n${new Date().toISOString()}`, {
         status: 200,
         headers: { "Content-Type": "text/plain" }
       });
     }
     
-    // VLESS over WebSocket
+    // 🔹 VLESS over WebSocket
     if (url.pathname === WS_PATH && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-      return handleVLESSWS(request);
+      return handleVLESSWS(request, env);
     }
     
-    return new Response("Not Found", { status: 404 });
+    return new Response("Not Found - Use /status or /proxy", { status: 404 });
   }
 };
 
-async function handleVLESSWS(request) {
-  const { 0: clientWS, 1: serverWS } = new WebSocketPair();
-  serverWS.accept();
+async function handleVLESSWS(request, env) {
+  const { 0: client, 1: server } = new WebSocketPair();
+  server.accept();
   
-  // Буфер для входящих данных
-  let buffer = new Uint8Array();
-  let remoteWriter = null;
-  let remoteReader = null;
+  let remoteSocket = null;
+  let hasParsedHeader = false;
+  let uuid = env.UUID || UUID;
   
-  serverWS.addEventListener("message", async (event) => {
+  server.addEventListener("message", async (event) => {
     try {
       const data = event.data instanceof ArrayBuffer 
         ? new Uint8Array(event.data) 
         : new TextEncoder().encode(event.data);
       
-      // Добавляем новые данные в буфер
-      const newBuffer = new Uint8Array(buffer.length + data.length);
-      newBuffer.set(buffer);
-      newBuffer.set(data, buffer.length);
-      buffer = newBuffer;
-      
-      // Если соединение ещё не установлено — парсим заголовок VLESS
-      if (!remoteWriter) {
-        const parsed = parseVlessHeader(buffer, UUID);
+      // Парсим заголовок VLESS только один раз
+      if (!hasParsedHeader) {
+        const parsed = parseVlessHeader(data, uuid);
         if (!parsed) {
-          console.error("Failed to parse VLESS header");
-          serverWS.close(1008, "Invalid VLESS header");
+          console.error("Invalid VLESS header");
+          server.close(1008, "Bad protocol");
           return;
         }
         
-        // Остаток данных после заголовка — это начало запроса к цели
-        const payload = buffer.slice(parsed.offset);
+        hasParsedHeader = true;
         
-        // Устанавливаем соединение с целевым сервером
-        const { writer, reader } = await connectToTarget(parsed.address, parsed.port, payload);
-        remoteWriter = writer;
-        remoteReader = reader;
+        // Устанавливаем TCP-соединение с целью через cloudflare:sockets
+        remoteSocket = connect(`${parsed.address}:${parsed.port}`);
         
-        // Запускаем чтение ответа от цели
-        pumpRemoteToWS(reader, serverWS);
-      } else {
-        // Соединение уже установлено — просто пересылаем данные
-        await remoteWriter.write(data);
+        // Отправляем остаток данных (начало запроса)
+        if (parsed.payload && parsed.payload.length > 0) {
+          await remoteSocket.writable.getWriter().write(parsed.payload);
+        }
+        
+        // Читаем ответ от цели и пересылаем в WebSocket
+        pumpRemoteToWS(remoteSocket.readable, server);
+        
+      } else if (remoteSocket) {
+        // Соединение уже установлено — просто пересылаем
+        await remoteSocket.writable.getWriter().write(data);
       }
     } catch (err) {
       console.error("WS message error:", err);
-      serverWS.close(1011, "Internal error");
+      server.close(1011, "Internal error");
     }
   });
   
-  serverWS.addEventListener("close", () => {
-    remoteWriter?.close?.();
+  server.addEventListener("close", () => {
+    remoteSocket?.close?.();
   });
   
-  serverWS.addEventListener("error", (err) => {
+  server.addEventListener("error", (err) => {
     console.error("WS error:", err);
   });
   
   return new Response(null, {
     status: 101,
-    webSocket: clientWS,
+    webSocket: client,
   });
 }
 
-/**
- * Парсинг заголовка VLESS (упрощённый, для TCP/HTTP)
- */
 function parseVlessHeader(buffer, uuid) {
   if (buffer.length < 24) return null;
+  if (buffer[0] !== 0) return null; // version must be 0
   
-  // Проверка версии (должна быть 0)
-  if (buffer[0] !== 0) return null;
-  
-  // Проверка UUID (16 байт, начиная с позиции 1)
+  // Проверка UUID (16 байт после версии)
   const uuidBytes = buffer.slice(1, 17);
   const uuidHex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
   if (uuidHex !== uuid.replace(/-/g, '')) return null;
@@ -113,18 +107,14 @@ function parseVlessHeader(buffer, uuid) {
   const addrType = buffer[offset++];
   let address = "";
   
-  if (addrType === 1) {
-    // IPv4
+  if (addrType === 1) { // IPv4
     address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
     offset += 4;
-  } else if (addrType === 2) {
-    // Domain
+  } else if (addrType === 2) { // Domain
     const len = buffer[offset++];
-    const decoder = new TextDecoder();
-    address = decoder.decode(buffer.slice(offset, offset + len));
+    address = new TextDecoder().decode(buffer.slice(offset, offset + len));
     offset += len;
-  } else if (addrType === 3) {
-    // IPv6 (упрощённо)
+  } else if (addrType === 3) { // IPv6
     const bytes = buffer.slice(offset, offset + 16);
     address = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(':');
     offset += 16;
@@ -136,64 +126,26 @@ function parseVlessHeader(buffer, uuid) {
   const port = (buffer[offset] << 8) | buffer[offset + 1];
   offset += 2;
   
-  return { address, port, offset };
+  return {
+    address,
+    port,
+    payload: buffer.slice(offset), // Остаток данных — начало запроса
+  };
 }
 
-/**
- * Подключение к целевому серверу через fetch
- */
-async function connectToTarget(host, port, initialData) {
-  // Для HTTP/HTTPS используем fetch с правильным методом
-  const isHTTPS = port === 443;
-  const protocol = isHTTPS ? 'https' : 'http';
-  
-  // Парсим начало запроса, чтобы извлечь метод и путь
-  const text = new TextDecoder().decode(initialData);
-  const requestLine = text.split('\r\n')[0];
-  const match = requestLine?.match(/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|CONNECT|PATCH)\s+([^\s]+)\s+HTTP/);
-  
-  const method = match ? match[1] : 'GET';
-  const path = match ? match[2] : '/';
-  const url = `${protocol}://${host}${port === 443 || port === 80 ? '' : `:${port}`}${path}`;
-  
-  // Создаём потоки для двусторонней связи
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  
-  // Отправляем initialData (начало запроса)
-  if (initialData.length > 0) {
-    await writer.write(initialData);
-  }
-  
-  // Запускаем fetch в фоне
-  (async () => {
-    try {
-      const response = await fetch(url, {
-        method,
-        headers: {
-          'Host': host,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          'Accept': '*/*',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Connection': 'keep-alive',
-        },
-        body: readable,
-        duplex: 'half',
-      });
-      
-      // Если ответ есть — пересылаем его обратно (обработчик в pumpRemoteToWS)
-    } catch (err) {
-      console.error(`fetch error for ${url}:`, err);
+async function pumpRemoteToWS(remoteReadable, webSocket) {
+  const reader = remoteReadable.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (webSocket.readyState === WebSocket.OPEN) {
+        webSocket.send(value);
+      }
     }
-  })();
-  
-  return { writer, reader: null }; // reader обрабатывается отдельно
-}
-
-/**
- * Пересылка ответа от fetch обратно в WebSocket
- */
-async function pumpRemoteToWS(remoteReader, webSocket) {
-  // Для упрощения: ожидаем, что fetch завершится и вернёт ответ
-  // В полной реализации нужно стримить ответ по частям
+  } catch (err) {
+    console.error("pumpRemoteToWS error:", err);
+  } finally {
+    reader.releaseLock();
+  }
 }

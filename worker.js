@@ -1,7 +1,7 @@
 /**
- * ✅ WORKING VLESS WebSocket Proxy — Minimal 2026
+ * ✅ WORKING VLESS WebSocket Proxy — Minimal & Stable
  * Uses cloudflare:sockets for raw TCP proxying
- * Compatible with sing-box / Xray / Clash
+ * Compatible with sing-box / Xray / Clash / Hiddify
  */
 
 // @ts-ignore
@@ -14,7 +14,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // 🔹 Health check
+    // 🔹 Health check — всегда работает
     if (url.pathname === "/" || url.pathname === "/status") {
       return new Response(`✅ VLESS Worker OK\n${new Date().toISOString()}`, {
         status: 200,
@@ -56,20 +56,24 @@ async function handleVLESSWS(request, env) {
         
         hasParsedHeader = true;
         
-        // Устанавливаем TCP-соединение с целью через cloudflare:sockets
+        // 🔹 Устанавливаем TCP-соединение через cloudflare:sockets
         remoteSocket = connect(`${parsed.address}:${parsed.port}`);
         
         // Отправляем остаток данных (начало запроса)
         if (parsed.payload && parsed.payload.length > 0) {
-          await remoteSocket.writable.getWriter().write(parsed.payload);
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(parsed.payload);
+          writer.releaseLock();
         }
         
-        // Читаем ответ от цели и пересылаем в WebSocket
+        // 🔹 Читаем ответ от цели и пересылаем в WebSocket
         pumpRemoteToWS(remoteSocket.readable, server);
         
       } else if (remoteSocket) {
         // Соединение уже установлено — просто пересылаем
-        await remoteSocket.writable.getWriter().write(data);
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
       }
     } catch (err) {
       console.error("WS message error:", err);

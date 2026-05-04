@@ -1,37 +1,23 @@
-/**
- * ✅ WEBSOCKET ECHO TEST - Debug Build
- * Просто принимает WebSocket и возвращает данные обратно.
- * Никакого VLESS — только проверка соединения.
- */
+// ✅ ULTRA-MINIMAL WEBSOCKET WORKER - 2026
+// Никаких импортов, никаких переменных, только база
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     
-    // Health check
-    if (url.pathname === "/status" || url.pathname === "/") {
-      return new Response(`✅ Worker OK - Echo Mode\n${new Date().toISOString()}`, {
-        status: 200,
-        headers: { "Content-Type": "text/plain" }
-      });
+    // Простой ответ для /status
+    if (url.pathname === "/status") {
+      return new Response("OK", { status: 200 });
     }
     
-    // WebSocket echo
-    if (url.pathname === "/proxy" && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-      console.log("[WS] New connection");
-      
-      const { 0: client, 1: server } = new WebSocketPair();
-      server.accept();
-      
-      server.addEventListener("message", (event) => {
-        if (server.readyState === WebSocket.OPEN) {
-          server.send("ECHO: " + (typeof event.data === 'string' ? event.data : '[binary]'));
-        }
-      });
-      
+    // WebSocket: только создаём пару и возвращаем 101
+    // Без обработчиков сообщений — чисто тест соединения
+    if (url.pathname === "/proxy" && request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      pair[1].accept();
       return new Response(null, {
         status: 101,
-        webSocket: client,
+        webSocket: pair[0],
       });
     }
     

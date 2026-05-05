@@ -1,119 +1,76 @@
 /**
  * ✅ VLESS WebSocket Worker для Cloudflare
- * - Health check: /status → "OK"
- * - Proxy: /proxy → VLESS over WebSocket
- * - CORS: разрешает запросы с любого источника (для теста)
- * - Error handling: никогда не возвращает 1101
+ * Версия: 2.1 (стабильная)
+ * - /status → health check
+ * - /proxy → VLESS over WebSocket (эхо-режим)
+ * - Глобальный try/catch → никогда не возвращает 1101
  */
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
-      const pathname = url.pathname;
+      const path = url.pathname;
 
-      // 🔹 1. Health Check (для теста в браузере)
-      if (pathname === "/status" || pathname === "/") {
-        return new Response("✅ Worker OK: " + new Date().toISOString(), {
+      // 🔹 Health check (для тестов)
+      if (path === "/status" || path === "/") {
+        return new Response("✅ OK:" + Date.now(), {
           status: 200,
           headers: {
             "Content-Type": "text/plain",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version, Connection, Host"
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Host, Upgrade, Connection"
           }
         });
       }
 
-      // 🔹 2. Preflight CORS (для браузерных запросов)
+      // 🔹 CORS preflight
       if (request.method === "OPTIONS") {
         return new Response(null, {
           status: 204,
           headers: {
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version, Connection, Host",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Host, Upgrade, Connection",
             "Access-Control-Max-Age": "86400"
           }
         });
       }
 
-      // 🔹 3. VLESS over WebSocket
-      if (pathname === "/proxy" && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-        return await handleWebSocket(request);
+      // 🔹 WebSocket для VLESS
+      if (path === "/proxy" && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+        const { 0: client, 1: server } = new WebSocketPair();
+        server.accept();
+
+        server.addEventListener("message", (event) => {
+          if (server.readyState === WebSocket.OPEN) {
+            // Эхо-режим: отправляем данные обратно
+            // Для полноценного VLESS нужен парсинг заголовков
+            server.send(event.data);
+          }
+        });
+
+        server.addEventListener("close", () => {
+          if (client.readyState === WebSocket.OPEN) client.close();
+        });
+
+        return new Response(null, {
+          status: 101,
+          webSocket: client,
+          headers: { "Access-Control-Allow-Origin": "*" }
+        });
       }
 
-      // 🔹 4. Всё остальное → 404
-      return new Response("Not Found - Use /status or /proxy", {
-        status: 404,
+      // 🔹 Всё остальное → 404
+      return new Response("Not Found", { status: 404 });
+
+    } catch (e) {
+      // 🔹 Глобальный перехват ошибок — НИКОГДА не 1101
+      return new Response("ERR:" + e.message, {
+        status: 500,
         headers: { "Content-Type": "text/plain" }
       });
-
-    } catch (error) {
-      // 🔹 Глобальный перехват ошибок — НИКОГДА не возвращать 1101
-      return new Response(
-        "❌ Worker Error:\n" + error.name + ": " + error.message + "\n\n" + (error.stack || ""),
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "text/plain; charset=utf-8",
-            "Access-Control-Allow-Origin": "*"
-          }
-        }
-      );
     }
   }
 };
-
-/**
- * 🔹 Обработчик WebSocket для VLESS
- * Упрощённая версия: эхо-режим + базовая совместимость
- */
-async function handleWebSocket(request) {
-  const { 0: client, 1: server } = new WebSocketPair();
-  server.accept();
-
-  // 🔹 При получении сообщения от клиента
-  server.addEventListener("message", async (event) => {
-    try {
-      const data = event.data;
-      
-      // 🔹 Если данные — строка, просто эхо
-      if (typeof data === "string") {
-        if (server.readyState === WebSocket.OPEN) {
-          server.send(data);
-        }
-        return;
-      }
-      
-      // 🔹 Если данные — бинарные (VLESS трафик)
-      // Для полноценной поддержки нужен парсинг заголовков VLESS
-      // Здесь — базовая пересылка (работает с sing-box в режиме "simple")
-      if (server.readyState === WebSocket.OPEN) {
-        server.send(data);
-      }
-      
-    } catch (err) {
-      console.error("WebSocket message error:", err);
-      if (server.readyState === WebSocket.OPEN) {
-        server.close(1011, "Internal error");
-      }
-    }
-  });
-
-  // 🔹 При закрытии соединения
-  server.addEventListener("close", () => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.close();
-    }
-  });
-
-  // 🔹 Возвращаем ответ 101 Switching Protocols
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-    headers: {
-      "Access-Control-Allow-Origin": "*"
-    }
-  });
-}
